@@ -1,0 +1,708 @@
+import 'package:flutter/material.dart';
+import 'package:go_router/go_router.dart';
+import 'package:google_fonts/google_fonts.dart';
+import 'package:indo_mobile/core/database/boxes.dart';
+import 'package:indo_mobile/core/di/sl.dart';
+import 'package:indo_mobile/core/theme/color_conts.dart';
+import 'package:indo_mobile/core/util/toast.dart';
+import 'package:indo_mobile/features/home/bloc/home_bloc.dart';
+import 'package:indo_mobile/features/scanner/model/round_data_model.dart';
+import 'package:indo_mobile/features/scanner/scan_details_view.dart';
+import 'package:indo_mobile/features/scanner/scanner_view.dart';
+import 'package:usb_serial/usb_serial.dart';
+import 'package:permission_handler/permission_handler.dart';
+import 'dart:convert';
+import 'dart:async';
+import 'dart:typed_data';
+import 'dart:developer';
+
+class UsbScannerWithConnectionScreen extends StatefulWidget {
+  const UsbScannerWithConnectionScreen({super.key, required this.args});
+  final ScannerViewArguments args;
+  static const String routeName = '/usb-scanner';
+
+  @override
+  State<UsbScannerWithConnectionScreen> createState() =>
+      _UsbScannerWithConnectionScreenState();
+}
+
+class _UsbScannerWithConnectionScreenState
+    extends State<UsbScannerWithConnectionScreen> {
+  late final HomeBloc homeBloc;
+  List<UsbDevice> _devices = [];
+  UsbPort? _port;
+  StreamSubscription<Uint8List>? _dataSubscription;
+  StreamSubscription? _usbEventSubscription;
+
+  String _connectionStatus = 'No device connected';
+  Color _statusColor = Colors.grey;
+
+  String? _lastScannedBarcode;
+  Map<String, dynamic>? _apiResponseData;
+  bool _isLoading = false;
+  String? _errorMessage;
+  String? unitName;
+
+  Timer? _debounceTimer;
+  String? _lastScannedCode;
+  Timer? _periodicRefreshTimer;
+
+  @override
+  void initState() {
+    super.initState();
+    homeBloc = sl<HomeBloc>();
+    homeBloc.add(FetchClientDataEvent(filterBy: '1', keyword: ''));
+    _requestUsbPermission();
+    _refreshDevices();
+    _listenToUsbEvents();
+    _startPeriodicRefresh();
+  }
+
+  void _onScan(String value) {
+    if (value.trim().isEmpty) {
+      showToast(
+        context,
+        'No data scanned',
+        backgroundColor: Colors.red.shade400,
+      );
+    } else {
+      setState(() {
+        _lastScannedBarcode = value.toString();
+      });
+      context.pushNamed(
+        ScanDetailsView.routeName,
+        extra: SubmitData(
+          unitName: unitName ?? 'N/A ',
+          rKey: widget.args.rKey,
+          baseID: value.trim(),
+          unitIndex: widget.args.unitIndex,
+        ),
+      );
+    }
+  }
+
+  bool isShowListButton() {
+    final box = Boxes.getData();
+    final data = box.values.toList().cast<RoundDataModel>();
+    final clientData = data.where((item) => item.rKey == widget.args.rKey);
+    if (clientData.isNotEmpty) {
+      return true;
+    } else {
+      return false;
+    }
+  }
+
+  void stopDuplicateUSBScan(String code) {
+    final box = Boxes.getData();
+    final scannedData = box.values.toList().cast<RoundDataModel>();
+    final clientData = scannedData.where(
+      (item) => item.rKey == widget.args.rKey,
+    );
+
+    if (clientData.any((item) => item.batchID == _lastScannedCode)) {
+      showDialog(
+        context: context,
+        barrierDismissible: false,
+        builder: (BuildContext context) {
+          return Dialog(
+            backgroundColor: Colors.transparent,
+            elevation: 0,
+            child: Container(
+              decoration: BoxDecoration(
+                gradient: LinearGradient(
+                  colors: [Colors.white, Colors.grey.shade50],
+                  begin: Alignment.topLeft,
+                  end: Alignment.bottomRight,
+                ),
+                borderRadius: BorderRadius.circular(20),
+                boxShadow: [
+                  BoxShadow(
+                    color: Colors.black.withOpacity(0.2),
+                    blurRadius: 25,
+                    offset: const Offset(0, 10),
+                  ),
+                ],
+              ),
+              padding: const EdgeInsets.all(28),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Container(
+                    padding: const EdgeInsets.all(14),
+                    decoration: BoxDecoration(
+                      gradient: LinearGradient(
+                        colors: [Colors.orange.shade100, Colors.orange.shade50],
+                        begin: Alignment.topLeft,
+                        end: Alignment.bottomRight,
+                      ),
+                      shape: BoxShape.circle,
+                      boxShadow: [
+                        BoxShadow(
+                          color: Colors.orange.shade200.withOpacity(0.5),
+                          blurRadius: 12,
+                          offset: const Offset(0, 4),
+                        ),
+                      ],
+                    ),
+                    child: Icon(
+                      Icons.warning_amber_rounded,
+                      color: Colors.orange.shade600,
+                      size: 36,
+                    ),
+                  ),
+                  const SizedBox(height: 20),
+                  Text(
+                    'Duplicate Scan Detected',
+                    style: GoogleFonts.poppins(
+                      fontSize: 20,
+                      fontWeight: FontWeight.w700,
+                      color: Colors.black87,
+                      letterSpacing: 0.2,
+                    ),
+                    textAlign: TextAlign.center,
+                  ),
+                  const SizedBox(height: 16),
+                  Container(
+                    padding: const EdgeInsets.all(14),
+                    decoration: BoxDecoration(
+                      color: Colors.blue.shade50,
+                      borderRadius: BorderRadius.circular(12),
+                      border: Border.all(
+                        color: Colors.blue.shade200,
+                        width: 1.5,
+                      ),
+                      boxShadow: [
+                        BoxShadow(
+                          color: Colors.blue.shade100.withOpacity(0.3),
+                          blurRadius: 8,
+                          offset: const Offset(0, 2),
+                        ),
+                      ],
+                    ),
+                    child: Row(
+                      children: [
+                        Icon(
+                          Icons.qr_code_2,
+                          color: Colors.blue.shade600,
+                          size: 20,
+                        ),
+                        const SizedBox(width: 10),
+                        Expanded(
+                          child: Text(
+                            'Code: $_lastScannedCode',
+                            style: GoogleFonts.poppins(
+                              fontSize: 14,
+                              fontWeight: FontWeight.w600,
+                              color: Colors.blue.shade900,
+                              letterSpacing: 0.3,
+                            ),
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(height: 16),
+                  Text(
+                    'This batch code has already been scanned. Would you like to add it again?',
+                    style: GoogleFonts.poppins(
+                      fontSize: 14,
+                      fontWeight: FontWeight.w500,
+                      color: Colors.grey.shade700,
+                      height: 1.5,
+                    ),
+                    textAlign: TextAlign.center,
+                  ),
+                  const SizedBox(height: 28),
+                  Row(
+                    children: [
+                      Expanded(
+                        child: ElevatedButton(
+                          onPressed: () {
+                            context.pop();
+                          },
+                          style: ElevatedButton.styleFrom(
+                            backgroundColor: Colors.grey.shade200,
+                            foregroundColor: Colors.grey.shade700,
+                            elevation: 0,
+                            padding: const EdgeInsets.symmetric(vertical: 14),
+                            shape: RoundedRectangleBorder(
+                              borderRadius: BorderRadius.circular(12),
+                              side: BorderSide(
+                                color: Colors.grey.shade300,
+                                width: 1,
+                              ),
+                            ),
+                          ),
+                          child: Text(
+                            'Cancel',
+                            style: GoogleFonts.poppins(
+                              fontSize: 15,
+                              fontWeight: FontWeight.w600,
+                              letterSpacing: 0.3,
+                            ),
+                          ),
+                        ),
+                      ),
+                      const SizedBox(width: 12),
+                      Expanded(
+                        child: ElevatedButton(
+                          onPressed: () {
+                            context.pop();
+                            _onScan(code);
+                          },
+                          style: ElevatedButton.styleFrom(
+                            backgroundColor: secondaryColor,
+                            foregroundColor: Colors.white,
+                            elevation: 4,
+                            padding: const EdgeInsets.symmetric(vertical: 14),
+                            shape: RoundedRectangleBorder(
+                              borderRadius: BorderRadius.circular(12),
+                            ),
+                            shadowColor: secondaryColor.withOpacity(0.4),
+                          ),
+                          child: Text(
+                            'Add Again',
+                            style: GoogleFonts.poppins(
+                              fontSize: 15,
+                              fontWeight: FontWeight.w600,
+                              letterSpacing: 0.3,
+                            ),
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+          );
+        },
+      );
+      return;
+    } else {
+      _onScan(code);
+    }
+  }
+
+  /// Request storage permission (needed for USB operations)
+  Future<void> _requestUsbPermission() async {
+    try {
+      final storageStatus = await Permission.storage.request();
+      if (storageStatus.isDenied) {
+        log('Storage permission denied');
+      } else if (storageStatus.isPermanentlyDenied) {
+        log('Storage permission permanently denied, opening app settings');
+        openAppSettings();
+      }
+      log('Storage permission granted');
+    } catch (e) {
+      log('Error requesting storage permission: $e');
+    }
+  }
+
+  /// List all connected USB devices
+  Future<void> _refreshDevices() async {
+    try {
+      final devices = await UsbSerial.listDevices();
+      if (!mounted) return;
+
+      log('Found ${devices.length} USB devices');
+      for (var device in devices) {
+        log(
+          'Device: ${device.productName}, VID: ${device.vid}, PID: ${device.pid}',
+        );
+      }
+
+      setState(() {
+        _devices = devices;
+        if (_devices.isEmpty) {
+          _connectionStatus = 'No USB devices found - Check OTG connection';
+          _statusColor = Colors.orange;
+        } else {
+          _connectionStatus = 'Found ${_devices.length} USB device(s)';
+          _statusColor = Colors.blue;
+        }
+      });
+    } catch (e) {
+      log('Error refreshing devices: $e');
+      if (!mounted) return;
+      setState(() {
+        _connectionStatus = 'Error: ${e.toString()}';
+        _statusColor = Colors.red;
+      });
+    }
+  }
+
+  /// Start periodic device refresh (every 2 seconds)
+  void _startPeriodicRefresh() {
+    _periodicRefreshTimer = Timer.periodic(
+      const Duration(seconds: 2),
+      (_) => _refreshDevices(),
+    );
+  }
+
+  /// Listen to USB attach/detach events
+  void _listenToUsbEvents() {
+    try {
+      _usbEventSubscription = UsbSerial.usbEventStream?.listen(
+        (event) {
+          log('USB Event received: $event');
+          setState(() {
+            _connectionStatus = 'USB Event: ${event.toString()}';
+          });
+          _refreshDevices(); // Refresh list when device is plugged/unplugged
+        },
+        onError: (error) {
+          log('Error in USB event stream: $error');
+        },
+      );
+    } catch (e) {
+      log('Error setting up USB event listener: $e');
+    }
+  }
+
+  /// Connect to a specific device
+  Future<void> _connectToDevice(UsbDevice device) async {
+    try {
+      await _disconnect(); // Close any previous connection
+      log('Attempting to connect to device: ${device.productName}');
+
+      _port = await device.create();
+      if (_port == null) {
+        log('Failed to create port for device');
+        setState(() {
+          _connectionStatus = 'Failed to create port';
+          _statusColor = Colors.red;
+        });
+        if (mounted) {
+          showToast(
+            context,
+            'Failed to create USB port',
+            backgroundColor: Colors.red.shade400,
+          );
+        }
+        return;
+      }
+
+      final bool opened = await _port!.open();
+      if (!opened) {
+        log('Failed to open port');
+        setState(() {
+          _connectionStatus = 'Failed to open port';
+          _statusColor = Colors.red;
+        });
+        if (mounted) {
+          showToast(
+            context,
+            'Failed to open USB port',
+            backgroundColor: Colors.red.shade400,
+          );
+        }
+        return;
+      }
+
+      // Common settings for barcode scanners (adjust baud rate as per your scanner manual)
+      try {
+        await _port!.setDTR(true);
+        await _port!.setRTS(true);
+        await _port!.setPortParameters(
+          9600, // Try 9600, 115200, 19200 etc. based on scanner
+          UsbPort.DATABITS_8,
+          UsbPort.STOPBITS_1,
+          UsbPort.PARITY_NONE,
+        );
+        log('Port parameters set successfully');
+      } catch (e) {
+        log('Error setting port parameters: $e');
+        // Continue anyway, as some devices may not support these settings
+      }
+
+      // Listen to incoming scanned data
+      _dataSubscription = _port!.inputStream!.listen(
+        (Uint8List data) {
+          final String scanned = String.fromCharCodes(data).trim();
+          log('Raw data received: $scanned');
+          if (scanned.isNotEmpty) {
+            _handleScannedBarcode(scanned);
+          }
+        },
+        onError: (error) {
+          log('Error in input stream: $error');
+          setState(() {
+            _connectionStatus = 'Connection lost: $error';
+            _statusColor = Colors.red;
+          });
+        },
+      );
+
+      setState(() {
+        _connectionStatus =
+            'Connected to ${device.productName ?? 'Unknown Scanner'}';
+        _statusColor = Colors.green;
+      });
+
+      log('Successfully connected to ${device.productName}');
+      if (mounted) {
+        showToast(
+          context,
+          'Connected to ${device.productName}',
+          backgroundColor: Colors.green.shade400,
+        );
+      }
+    } catch (e) {
+      log('Error connecting to device: $e');
+      setState(() {
+        _connectionStatus = 'Connection error: $e';
+        _statusColor = Colors.red;
+      });
+      if (mounted) {
+        showToast(
+          context,
+          'Connection error: $e',
+          backgroundColor: Colors.red.shade400,
+        );
+      }
+    }
+  }
+
+  /// Disconnect from current device
+  Future<void> _disconnect() async {
+    try {
+      log('Disconnecting from device...');
+      await _dataSubscription?.cancel();
+      await _port?.close();
+      _port = null;
+      _dataSubscription = null;
+
+      if (!mounted) return;
+      setState(() {
+        _connectionStatus = 'Disconnected';
+        _statusColor = Colors.grey;
+      });
+      log('Disconnected successfully');
+    } catch (e) {
+      log('Error disconnecting: $e');
+    }
+  }
+
+  /// Process scanned barcode → Check for duplicates
+  void _handleScannedBarcode(String barcode) {
+    final cleanBarcode = barcode.trim();
+    log('Processing barcode: $cleanBarcode');
+    if (cleanBarcode.isNotEmpty) {
+      setState(() {
+        _lastScannedCode = cleanBarcode;
+      });
+      _debounceTimer?.cancel();
+      _debounceTimer = Timer(const Duration(milliseconds: 300), () {
+        log('Calling stopDuplicateUSBScan with code: $cleanBarcode');
+        stopDuplicateUSBScan(cleanBarcode);
+      });
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('USB Scanner + API'),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.refresh),
+            onPressed: _refreshDevices,
+            tooltip: 'Refresh Devices',
+          ),
+        ],
+      ),
+      body: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            // Connection Status
+            Card(
+              color: _statusColor.withOpacity(0.1),
+              child: ListTile(
+                leading: Icon(Icons.usb, color: _statusColor),
+                title: Text(
+                  _connectionStatus,
+                  style: TextStyle(
+                    color: _statusColor,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+                trailing: _port != null
+                    ? ElevatedButton(
+                        onPressed: _disconnect,
+                        child: const Text('Disconnect'),
+                      )
+                    : null,
+              ),
+            ),
+
+            const SizedBox(height: 16),
+
+            // Available Devices
+            Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                const Text(
+                  'Available USB Devices',
+                  style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+                ),
+                ElevatedButton.icon(
+                  onPressed: _refreshDevices,
+                  icon: const Icon(Icons.refresh, size: 18),
+                  label: const Text('Refresh'),
+                  style: ElevatedButton.styleFrom(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 12,
+                      vertical: 8,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+            Expanded(
+              child: _devices.isEmpty
+                  ? Center(
+                      child: Column(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: [
+                          Icon(
+                            Icons.usb_off,
+                            size: 64,
+                            color: Colors.grey.shade400,
+                          ),
+                          const SizedBox(height: 16),
+                          Text(
+                            'No USB devices detected',
+                            style: TextStyle(
+                              fontSize: 16,
+                              fontWeight: FontWeight.w600,
+                              color: Colors.grey.shade700,
+                            ),
+                          ),
+                          const SizedBox(height: 8),
+                          Text(
+                            'Please check:',
+                            style: TextStyle(
+                              fontSize: 12,
+                              color: Colors.grey.shade600,
+                            ),
+                          ),
+                          const SizedBox(height: 8),
+                          Padding(
+                            padding: const EdgeInsets.symmetric(horizontal: 32),
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text(
+                                  '• USB device is connected via OTG',
+                                  style: TextStyle(
+                                    fontSize: 12,
+                                    color: Colors.grey.shade600,
+                                  ),
+                                ),
+                                const SizedBox(height: 4),
+                                Text(
+                                  '• Device has power (powered OTG)',
+                                  style: TextStyle(
+                                    fontSize: 12,
+                                    color: Colors.grey.shade600,
+                                  ),
+                                ),
+                                const SizedBox(height: 4),
+                                Text(
+                                  '• Device drivers are installed',
+                                  style: TextStyle(
+                                    fontSize: 12,
+                                    color: Colors.grey.shade600,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                          const SizedBox(height: 16),
+                          ElevatedButton.icon(
+                            onPressed: _refreshDevices,
+                            icon: const Icon(Icons.refresh),
+                            label: const Text('Try Again'),
+                          ),
+                        ],
+                      ),
+                    )
+                  : ListView.builder(
+                      itemCount: _devices.length,
+                      itemBuilder: (context, index) {
+                        final device = _devices[index];
+                        final isConnected =
+                            _port != null &&
+                            device == _devices.first; // Simple check
+                        return ListTile(
+                          leading: const Icon(Icons.devices),
+                          title: Text(device.productName ?? 'Unknown'),
+                          subtitle: Text(
+                            'VID: ${device.vid}  PID: ${device.pid}',
+                          ),
+                          trailing: ElevatedButton(
+                            onPressed: () => _connectToDevice(device),
+                            child: Text(isConnected ? 'Connected' : 'Connect'),
+                          ),
+                        );
+                      },
+                    ),
+            ),
+
+            const Divider(),
+
+            // Scan Result & API Data
+            if (_lastScannedBarcode != null)
+              Text(
+                'Last Barcode: $_lastScannedBarcode',
+                style: const TextStyle(fontWeight: FontWeight.bold),
+              ),
+
+            const SizedBox(height: 20),
+            Expanded(
+              child: Center(
+                child: _isLoading
+                    ? const CircularProgressIndicator()
+                    : _errorMessage != null
+                    ? Text(
+                        'Error: $_errorMessage',
+                        style: const TextStyle(color: Colors.red),
+                      )
+                    : _apiResponseData != null
+                    ? Card(
+                        child: Padding(
+                          padding: const EdgeInsets.all(16),
+                          child: Text(
+                            'API Response:\n${jsonEncode(_apiResponseData)}',
+                          ),
+                        ),
+                      )
+                    : const Text('Scan a barcode after connecting scanner'),
+              ),
+            ),
+          ],
+        ),
+      ),
+      floatingActionButton: FloatingActionButton(
+        onPressed: _refreshDevices,
+        child: const Icon(Icons.scanner),
+      ),
+    );
+  }
+
+  @override
+  void dispose() {
+    _debounceTimer?.cancel();
+    _periodicRefreshTimer?.cancel();
+    _dataSubscription?.cancel();
+    _usbEventSubscription?.cancel();
+    _port?.close();
+    super.dispose();
+  }
+}
