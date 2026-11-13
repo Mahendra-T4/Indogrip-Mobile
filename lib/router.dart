@@ -17,29 +17,7 @@ import 'package:indo_mobile/features/splash/splash_view.dart';
 class AppRoutes {
   static final GoRouter router = GoRouter(
     initialLocation: SplashScreen.routeName,
-    // redirect: (context, state) {
-    //   // Check if we're already on splash screen
-    //   if (state.matchedLocation == SplashScreen.routeName) {
-    //     return null; // Stay on splash, let it handle the navigation
-    //   }
 
-    //   // Check login status and redirect accordingly
-    //   final isLoggedIn = HiveService.isLoggedIn;
-
-    //   if (isLoggedIn) {
-    //     // If logged in but trying to go to login, redirect to home
-    //     if (state.matchedLocation == IndoGripLoginView.routeName) {
-    //       return AppHome.routeName;
-    //     }
-    //   } else {
-    //     // If not logged in but trying to go to protected routes, redirect to login
-    //     if (state.matchedLocation == AppHome.routeName ||
-    //         state.matchedLocation == ScannerView.routeName) {
-    //       return IndoGripLoginView.routeName;
-    //     }
-    //   }
-    //   return null;
-    // },
     routes: [
       GoRoute(
         path: IndoGripLoginView.routeName,
